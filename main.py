@@ -1,6 +1,6 @@
 """
 Backend Microservicio de Extracción de Videos de TikTok Sin Marca de Agua
-Powered by FastAPI & yt-dlp
+Powered by FastAPI, TikWM & yt-dlp
 """
 
 import os
@@ -8,7 +8,8 @@ import re
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
+import requests
 import yt_dlp
 
 app = FastAPI(
@@ -76,6 +77,64 @@ def process_url(raw_url: str) -> VideoResponse:
     if not target_url:
         raise HTTPException(status_code=400, detail="URL inválida de TikTok")
 
+    # 1. Estrategia Principal: Usar TikWM para obtener enlaces de CDN globales (evita 403 IP binding)
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        response = requests.post(
+            'https://www.tikwm.com/api/',
+            data={'url': target_url, 'hd': 1},
+            headers=headers,
+            timeout=10
+        )
+
+        if response.status_code == 200:
+            res_json = response.json()
+            if res_json.get('code') == 0 and res_json.get('data'):
+                data = res_json['data']
+
+                play_url = data.get('play', '')
+                if play_url and not play_url.startswith('http'):
+                    play_url = f"https://www.tikwm.com{play_url}"
+
+                wmplay_url = data.get('wmplay', '')
+                if wmplay_url and not wmplay_url.startswith('http'):
+                    wmplay_url = f"https://www.tikwm.com{wmplay_url}"
+
+                video_url = play_url or wmplay_url
+
+                music_url = data.get('music', '')
+                if music_url and not music_url.startswith('http'):
+                    music_url = f"https://www.tikwm.com{music_url}"
+
+                cover_url = data.get('cover', '')
+                if cover_url and not cover_url.startswith('http'):
+                    cover_url = f"https://www.tikwm.com{cover_url}"
+
+                author_info = data.get('author', {})
+                unique_id = author_info.get('unique_id', 'tiktok_user')
+                nickname = author_info.get('nickname', unique_id)
+                avatar = author_info.get('avatar', cover_url)
+
+                if video_url:
+                    return VideoResponse(
+                        status="success",
+                        id=str(data.get('id', '')),
+                        title=data.get('title', 'TikTok Video'),
+                        author=f"@{unique_id}",
+                        author_name=nickname,
+                        author_avatar=avatar,
+                        thumbnail=cover_url,
+                        video_no_watermark=video_url,
+                        video_hd=video_url,
+                        audio_url=music_url or video_url,
+                        duration=data.get('duration', 0)
+                    )
+    except Exception as e:
+        print(f"Advertencia: Falló extracción vía TikWM API: {e}. Probando yt-dlp...")
+
+    # 2. Estrategia de Respaldo: yt-dlp
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -99,13 +158,11 @@ def process_url(raw_url: str) -> VideoResponse:
 
             formats = info.get('formats', [])
 
-            # Buscar stream sin marca de agua
             video_url = ""
             hd_url = ""
             audio_url = ""
 
             for f in formats:
-                # Filtrar formatos de audio y video
                 format_url = f.get('url', '')
                 if not format_url:
                     continue
@@ -120,12 +177,6 @@ def process_url(raw_url: str) -> VideoResponse:
             if not video_url:
                 video_url = info.get('url', '')
 
-            if not hd_url:
-                hd_url = video_url
-
-            if not audio_url:
-                audio_url = video_url
-
             return VideoResponse(
                 status="success",
                 id=video_id,
@@ -135,8 +186,8 @@ def process_url(raw_url: str) -> VideoResponse:
                 author_avatar=thumbnail,
                 thumbnail=thumbnail,
                 video_no_watermark=video_url,
-                video_hd=hd_url,
-                audio_url=audio_url,
+                video_hd=hd_url or video_url,
+                audio_url=audio_url or video_url,
                 duration=duration
             )
     except Exception as e:
